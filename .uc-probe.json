@@ -1,0 +1,33 @@
+{
+  "ok": false,
+  "started_at": "2026-07-01T13:22:32.479045+00:00",
+  "probe": "undetected_chromedriver_google_captcha",
+  "inputs": {
+    "query": "what is 7*8 answer only the number",
+    "proxy": "socks5://127.0.0.1:10808",
+    "headless": false,
+    "artifact_dir": "C:\\Users\\22975\\AppData\\Local\\Temp\\uc-google-probe-artifacts-5g7w_rdx",
+    "profile_dir": "C:\\Users\\22975\\AppData\\Local\\Temp\\uc-google-profile-_s30hhon"
+  },
+  "environment": {
+    "python": "3.11.15 (main, May  4 2026, 21:17:00) [MSC v.1944 64 bit (AMD64)]",
+    "display": "needs-to-be-defined",
+    "chrome_binary": "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe",
+    "chrome_version": {
+      "ok": true,
+      "raw": "",
+      "major": null
+    },
+    "driver_executable_path": null,
+    "driver_exists": false,
+    "proxy_open": true
+  },
+  "stages": [],
+  "artifacts": {},
+  "error": "probe_exception",
+  "exception": {
+    "type": "ModuleNotFoundError",
+    "message": "No module named 'undetected_chromedriver'"
+  },
+  "finished_at": "2026-07-01T13:22:33.154342+00:00"
+}

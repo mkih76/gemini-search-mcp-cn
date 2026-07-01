@@ -1,18 +1,23 @@
-"""Lightweight engine for Google Search AI Overview (DOM-scraped).
+"""Lightweight engine for Google Search AI Mode (folwr token flow).
 
 Forked from gemini-search-mcp by Sophomoresty.
-Original used Google AI Mode via folwr token endpoint, which:
-  - Only works on US-region IPs with full AI Mode rollout
-  - Broke when Google changed the page structure (data-srtst no longer in HTML)
-  - Forced a redirect to google.com.hk which disabled AI Mode for non-US users
 
-This fork uses Google Search AI Overview directly:
-  - Loads https://www.google.com/search?q=... (Google handles redirect naturally)
-  - Waits for the AI Overview container (#m-x-content, class D5ad8b) to render
-  - Extracts synthesized answer + sources from the rendered DOM
-  - Falls back to top organic results if AI Overview is not available
+This version restores the original AI Mode folwr token flow and
+works around the CAPTCHA issue with two strategies:
 
-Compatible with the original MCP server entry points (gemini_search_mcp, gemini-search).
+Strategy A (primary): headed Chrome + persistent profile + US IP
+  - Real Chrome window briefly visible during CAPTCHA priming
+  - Reuses cookies via GEMINI_SEARCH_USER_DATA_DIR
+  - Real AI Mode answers (synthesized by Gemini, with sources)
+
+Strategy B (fallback): headless + organic SERP extraction
+  - For when headed isn't an option (background runs)
+  - Google blocks AI Mode tokens for headless, but still returns
+    regular search results. We extract top 5 organic results as
+    structured output.
+
+Headless mode auto-detected: if AI Mode token missing AND
+user_agent == headless, fall back to Strategy B automatically.
 """
 from __future__ import annotations
 
@@ -29,119 +34,99 @@ from typing import Optional
 
 try:
     import websockets
-except ImportError:  # pragma: no cover - surfaced at runtime by _connect_cdp
+except ImportError:
     websockets = None
 
 
-# JavaScript that:
-#   1. waits for #m-x-content (AI Overview container) to render, with timeout
-#   2. extracts the visible text + sources
-#   3. falls back to top organic results if AI Overview is absent
-_ASK_JS = """
+# Strategy A: AI Mode via folwr token endpoint (requires headed mode)
+_ASK_JS_AIMODE = """
 (async (q) => {
-    const wait = (ms) => new Promise(r => setTimeout(r, ms));
-    const t0 = Date.now();
-    const TIMEOUT_MS = 15000;
-
-    // Helper: clean Google SERP noise
-    const clean = (s) => {
-        if (!s) return '';
-        return s
-            .replace(/\\s+/g, ' ')
-            .replace(/AI Overview\\s*\\+\\d+\\s*/g, '')
-            .replace(/Show more/gi, '')
-            .trim();
-    };
-
-    // Try to find AI Overview (container with class D5ad8b or id m-x-content)
-    let aiContainer = null;
-    while (Date.now() - t0 < TIMEOUT_MS) {
-        aiContainer = document.querySelector('#m-x-content')
-                   || document.querySelector('.D5ad8b')
-                   || document.querySelector('[data-attrid="AIOverview"]');
-        if (aiContainer && aiContainer.innerText && aiContainer.innerText.length > 100) {
-            break;
-        }
-        aiContainer = null;
-        await wait(500);
-    }
-
-    if (aiContainer) {
-        // Extract the main synthesized answer text
-        // AI Overview structure: header + multiple <p> or list items + sources
-        const mainBlocks = [];
-        aiContainer.querySelectorAll('p, li').forEach(el => {
-            const t = clean(el.innerText);
-            if (t && t.length > 30 && !t.startsWith('AI Overview')) {
-                mainBlocks.push(t);
-            }
+    try {
+        const pageUrl = 'https://www.google.com/search?q=' + encodeURIComponent(q) + '&hl=en&gl=us&udm=50&aep=1&ntc=1';
+        const r1 = await fetch(pageUrl, {credentials:'include'});
+        if (!r1.ok) return {error:'fetch_status_' + r1.status, htmlLen:0, strategy:'aimode'};
+        const html = await r1.text();
+        const m = (p) => { const x = html.match(p); return x ? x[1] : ''; };
+        const srtst = m(/data-srtst="([^"]+)"/);
+        if (!srtst) return {error:'no_token', htmlLen:html.length, strategy:'aimode'};
+        const xsrf = m(/data-xsrf-folwr-token="([^"]+)"/);
+        const garc = m(/data-garc="([^"]+)"/);
+        const lro = m(/data-lro-token="([^"]+)"/);
+        const mlros = m(/data-lro-signature="([^"]+)"/);
+        const ei = m(/data-ei="([^"]+)"/);
+        const stkp = m(/data-stkp="([^"]+)"/);
+        const ved = m(/aria-current="page"[^>]*data-ved="([^"]+)"/);
+        const sca = m(/sca_esv=([a-f0-9]+)/);
+        const p = new URLSearchParams({srtst,garc,mlro:lro,mlros,ei,q,yv:'3',vet:'1'+ved+'..i',ved,aep:'1',gl:'us',hl:'en',sca_esv:sca,udm:'50',stkp,cs:'0',async:'_fmt:adl,_xsrf:'+xsrf});
+        const r2 = await fetch('https://www.google.com/async/folwr?'+p.toString(), {credentials:'include'});
+        if (!r2.ok) return {error:'folwr_status_' + r2.status, strategy:'aimode'};
+        const fh = await r2.text();
+        const div = document.createElement('div');
+        div.innerHTML = fh;
+        div.querySelectorAll('script,style,button,noscript,[aria-hidden="true"],span[style*="display:none"],.LGKDTe,.SGF5Lb').forEach(x => x.remove());
+        let parts = [];
+        div.querySelectorAll('.pTRUV').forEach(el => {
+            const t = el.textContent.trim();
+            if (t && t.length > 1) parts.push(t);
         });
-        // De-dupe consecutive identicals
-        const seen = new Set();
-        const unique = [];
-        for (const b of mainBlocks) {
-            if (!seen.has(b)) { seen.add(b); unique.push(b); }
-        }
-
-        // Extract source citations
-        const sources = [];
-        aiContainer.querySelectorAll('a[href^="http"]').forEach(a => {
-            const href = a.href;
-            const title = clean(a.innerText);
-            if (href && !href.includes('google.com') && title) {
-                sources.push({title, url: href});
-            }
+        div.querySelectorAll('.n6owBd').forEach(el => {
+            const t = el.textContent.trim();
+            if (t && t.length > 10) parts.push(t);
         });
-
-        return {
-            ok: true,
-            source: 'ai_overview',
-            answer: unique.join('\\n\\n'),
-            sources: sources.slice(0, 8),
-            elapsed_ms: Date.now() - t0,
-        };
-    }
-
-    // FALLBACK: no AI Overview, return top 5 organic results
-    const organic = [];
-    document.querySelectorAll('div.g, div[jscontroller][data-hveid]').forEach((el, idx) => {
-        if (organic.length >= 5) return;
-        const titleEl = el.querySelector('h3');
-        const linkEl = el.querySelector('a[href^="http"]');
-        const snippetEl = el.querySelector('.VwiC3b, .yXK7lf, [data-content-feature]');
-        if (titleEl && linkEl && snippetEl) {
-            organic.push({
-                title: clean(titleEl.innerText),
-                url: linkEl.href,
-                snippet: clean(snippetEl.innerText),
+        if (!parts.length) {
+            div.querySelectorAll('.mZJni,.XEqVsf,.ub891').forEach(x => x.remove());
+            div.querySelectorAll('[dir="ltr"]').forEach(el => {
+                const t = el.textContent.trim();
+                if (t.length > 30) parts.push(t);
             });
         }
-    });
-
-    if (organic.length === 0) {
-        return {
-            ok: false,
-            error: 'no_results',
-            elapsed_ms: Date.now() - t0,
-            finalUrl: window.location.href,
-        };
+        let text = parts.join('\\n\\n');
+        const noise = ['Copy','Share','Good response','Bad response','About this result','Show all','AI responses may include mistakes','Tell me which'];
+        for (const n of noise) { while (text.endsWith(n)) text = text.slice(0, -n.length).trim(); }
+        return {ok:true, answer:text, folwrLen:fh.length, strategy:'aimode'};
+    } catch(e) {
+        return {error:'js_exception', message:e.message, strategy:'aimode'};
     }
+})(%QUERY%)
+"""
 
-    return {
-        ok: true,
-        source: 'organic_fallback',
-        answer: organic.map((r, i) =>
-            `[${i+1}] ${r.title}\\n${r.snippet}\\n${r.url}`
-        ).join('\\n\\n'),
-        sources: organic,
-        elapsed_ms: Date.now() - t0,
-    };
+
+# Strategy B: organic SERP extraction (works in headless mode)
+_ASK_JS_ORGANIC = """
+(async (q) => {
+    try {
+        // Already on the search results page from Page.navigate in Python.
+        const organic = [];
+        document.querySelectorAll('div.g, div[jscontroller][data-hveid]').forEach((el) => {
+            if (organic.length >= 5) return;
+            const titleEl = el.querySelector('h3');
+            const linkEl = el.querySelector('a[href^="http"]');
+            const snippetEl = el.querySelector('.VwiC3b, .yXK7lf, [data-content-feature]');
+            if (titleEl && linkEl && snippetEl) {
+                organic.push({
+                    title: titleEl.innerText.trim(),
+                    url: linkEl.href,
+                    snippet: snippetEl.innerText.trim(),
+                });
+            }
+        });
+        if (organic.length === 0) return {error:'no_results', strategy:'organic'};
+        return {
+            ok:true,
+            strategy:'organic',
+            answer: organic.map((r, i) =>
+                `[${i+1}] ${r.title}\\n${r.snippet}\\n${r.url}`
+            ).join('\\n\\n'),
+            sources: organic,
+        };
+    } catch(e) {
+        return {error:'js_exception', message:e.message, strategy:'organic'};
+    }
 })(%QUERY%)
 """
 
 
 def _env_or_value(value: Optional[str], *env_names: str) -> Optional[str]:
-    """Return an explicit value, or the first non-empty environment value."""
     if value:
         return value
     for name in env_names:
@@ -179,13 +164,9 @@ def _find_chrome(channel: str = "chrome") -> str:
         if local_appdata:
             cft_root = Path(local_appdata) / "agent-browser-cli" / "chrome-for-testing"
             by_channel["chrome"].extend(
-                sorted(
-                    cft_root.glob("*/chrome-win64/chrome.exe"),
-                    key=_version_sort_key,
-                    reverse=True,
-                )
+                sorted(cft_root.glob("*/chrome-win64/chrome.exe"),
+                       key=_version_sort_key, reverse=True)
             )
-
         for key in ("PROGRAMFILES", "PROGRAMFILES(X86)", "LOCALAPPDATA"):
             base_value = os.environ.get(key)
             if not base_value:
@@ -243,23 +224,16 @@ def _find_chrome(channel: str = "chrome") -> str:
         found = shutil.which(candidate)
         if found:
             return found
-    raise RuntimeError("Chrome/Edge/Chromium not found. Install Chrome or set CHROME_PATH env var.")
+    raise RuntimeError("Chrome/Edge/Chromium not found.")
 
 
 def _chrome_major_version(binary: str) -> Optional[int]:
-    """Best-effort Chrome major version detection for undetected-chromedriver."""
     path_match = re.search(r"(?:^|[\\/])(\d+)\.\d+\.\d+\.\d+(?:[\\/]|$)", str(binary))
     if path_match:
         return int(path_match.group(1))
-
     try:
-        cp = subprocess.run(
-            [binary, "--version"],
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            timeout=10,
-        )
+        cp = subprocess.run([binary, "--version"], text=True,
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=10)
     except Exception:
         return None
     text = f"{cp.stdout}\n{cp.stderr}"
@@ -270,12 +244,8 @@ def _chrome_major_version(binary: str) -> Optional[int]:
 def _normalize_browser_backend(backend: Optional[str]) -> str:
     value = (backend or "subprocess").strip().lower()
     aliases = {
-        "raw": "subprocess",
-        "chrome": "subprocess",
-        "subprocess": "subprocess",
-        "uc": "undetected",
-        "undetected": "undetected",
-        "undetected-chromedriver": "undetected",
+        "raw": "subprocess", "chrome": "subprocess", "subprocess": "subprocess",
+        "uc": "undetected", "undetected": "undetected", "undetected-chromedriver": "undetected",
     }
     if value not in aliases:
         raise ValueError("browser_backend must be 'subprocess' or 'undetected'")
@@ -283,12 +253,7 @@ def _normalize_browser_backend(backend: Optional[str]) -> str:
 
 
 class AIModeEngine:
-    """Single-tab Chrome engine via raw CDP.
-
-    Loads Google Search results pages and waits for the AI Overview
-    container (#m-x-content) to render, then extracts synthesized answer
-    plus source citations.
-    """
+    """Single-tab Chrome engine via raw CDP. AI Mode primary, organic fallback."""
 
     def __init__(self):
         self._proc = None
@@ -302,6 +267,8 @@ class AIModeEngine:
         self._user_data_dir = None
         self._owns_user_data_dir = False
         self._browser_backend = "subprocess"
+        self._is_headless = True
+        self._supports_aimode = False  # Set during _warmup
 
     async def start(
         self,
@@ -313,11 +280,11 @@ class AIModeEngine:
         proxy_server: Optional[str] = None,
         chromedriver_path: Optional[str] = None,
     ):
-        """Start Chrome and connect via CDP."""
         self._cdp_url = cdp_url
         self._browser_backend = _normalize_browser_backend(
             _env_or_value(browser_backend, "GEMINI_SEARCH_BROWSER_BACKEND")
         )
+        self._is_headless = headless
         try:
             if cdp_url:
                 await self._connect_cdp(cdp_url)
@@ -358,18 +325,13 @@ class AIModeEngine:
         backend = _normalize_browser_backend(browser_backend)
         if backend == "undetected":
             await self._launch_undetected_chrome(
-                headless=headless,
-                channel=channel,
-                user_data_dir=user_data_dir,
-                proxy_server=proxy_server,
-                chromedriver_path=chromedriver_path,
+                headless=headless, channel=channel, user_data_dir=user_data_dir,
+                proxy_server=proxy_server, chromedriver_path=chromedriver_path,
             )
             return
         await self._launch_subprocess_chrome(
-            headless=headless,
-            channel=channel,
-            user_data_dir=user_data_dir,
-            proxy_server=proxy_server,
+            headless=headless, channel=channel,
+            user_data_dir=user_data_dir, proxy_server=proxy_server,
         )
 
     async def _launch_subprocess_chrome(
@@ -379,7 +341,6 @@ class AIModeEngine:
         user_data_dir: Optional[str] = None,
         proxy_server: Optional[str] = None,
     ):
-        """Launch Chrome subprocess with minimal automation footprint."""
         chrome_path = _find_chrome(channel)
         profile_dir = self._prepare_user_data_dir(user_data_dir)
         port = int(os.environ.get("GEMINI_SEARCH_CDP_PORT", "19250"))
@@ -392,7 +353,6 @@ class AIModeEngine:
             "--no-first-run",
             "--no-default-browser-check",
             "--disable-background-timer-throttling",
-            "--lang=en-US",
         ]
         if proxy:
             args.append(f"--proxy-server={proxy}")
@@ -414,7 +374,6 @@ class AIModeEngine:
         proxy_server: Optional[str] = None,
         chromedriver_path: Optional[str] = None,
     ):
-        """Launch Chrome through undetected-chromedriver, then use CDP."""
         try:
             import undetected_chromedriver as uc
         except ImportError as exc:
@@ -427,9 +386,7 @@ class AIModeEngine:
         port = int(os.environ.get("GEMINI_SEARCH_CDP_PORT", "19250"))
         proxy = _env_or_value(proxy_server, "GEMINI_SEARCH_PROXY_SERVER")
         driver_path = _env_or_value(
-            chromedriver_path,
-            "GEMINI_SEARCH_CHROMEDRIVER",
-            "UC_CHROMEDRIVER",
+            chromedriver_path, "GEMINI_SEARCH_CHROMEDRIVER", "UC_CHROMEDRIVER",
         )
 
         options = uc.ChromeOptions()
@@ -457,9 +414,7 @@ class AIModeEngine:
         await self._connect_cdp(f"http://127.0.0.1:{port}")
 
     async def _wait_for_cdp(self, port: int, label: str, timeout_sec: float = 20.0):
-        """Wait until Chrome exposes /json/version on the requested CDP port."""
         import urllib.request
-
         last_error = None
         attempts = max(1, int(timeout_sec * 2))
         for _ in range(attempts):
@@ -471,14 +426,12 @@ class AIModeEngine:
                 info = json.loads(data)
                 self._ws_url = info["webSocketDebuggerUrl"]
                 return
-            except Exception as exc:  # noqa: BLE001 - diagnostic retry loop
+            except Exception as exc:
                 last_error = exc
         raise RuntimeError(f"{label} did not expose CDP on port {port}: {last_error}")
 
     async def _connect_cdp(self, http_url):
-        """Connect to Chrome via CDP WebSocket."""
         import urllib.request
-
         try:
             data = urllib.request.urlopen(f"{http_url}/json/version", timeout=5).read()
             info = json.loads(data)
@@ -499,7 +452,6 @@ class AIModeEngine:
         self._ws = await websockets.connect(self._page_target, max_size=10 * 1024 * 1024)
 
     async def _cdp_send(self, method, params=None):
-        """Send a CDP command and return the result."""
         self._msg_id += 1
         msg = {"id": self._msg_id, "method": method, "params": params or {}}
         await self._ws.send(json.dumps(msg))
@@ -511,7 +463,6 @@ class AIModeEngine:
                 return resp.get("result", {})
 
     async def _evaluate(self, expression):
-        """Evaluate JS in the page and return the result."""
         result = await self._cdp_send("Runtime.evaluate", {
             "expression": expression,
             "awaitPromise": True,
@@ -525,7 +476,6 @@ class AIModeEngine:
         return val
 
     async def _navigate(self, url):
-        """Navigate the page to a URL and wait for load."""
         await self._cdp_send("Page.enable")
         await self._cdp_send("Page.navigate", {"url": url})
         for _ in range(60):
@@ -535,71 +485,80 @@ class AIModeEngine:
         await asyncio.sleep(1)
 
     async def _warmup(self):
-        """Navigate to Google search to verify cookies and warm up the session.
+        """Navigate to a NORMAL Google search page (NO udm) to build cookie
+        session, then probe whether AI Mode tokens are available.
 
-        Uses google.com (not .hk) so AI Overview eligibility is detected
-        correctly for the user's region. The page may redirect to .hk on
-        its own; both render AI Overview identically.
+        - headed + good IP: AI Mode works → set _supports_aimode=True
+        - headless or bad IP: AI Mode blocked → use organic fallback
         """
         await self._navigate("https://www.google.com/search?q=hello&hl=en&gl=us")
         url = await self._evaluate("window.location.href")
         if "/sorry/" in (url or ""):
             raise RuntimeError(
-                "Google CAPTCHA during warmup. Try a visible persistent profile, "
-                "an existing Chrome via --cdp-url, or --browser-backend undetected --no-headless."
+                "Google CAPTCHA during warmup. Prime the profile (run prime_chrome_v2.py "
+                "in headed mode first) or use --cdp-url to attach to a verified Chrome."
             )
 
-    async def ask(self, question: str, timeout_ms: int = 45000) -> str:
-        """Ask a question via Google Search and return the AI Overview answer.
+        # Probe AI Mode availability
+        probe_js = _ASK_JS_AIMODE.replace("%QUERY%", json.dumps("test"))
+        probe_result = await self._evaluate(probe_js)
+        if isinstance(probe_result, dict) and probe_result.get("ok"):
+            self._supports_aimode = True
+        else:
+            self._supports_aimode = False
 
-        On miss, falls back to top organic results.
-        Returns a plain string for MCP tool compatibility. The dict result
-        is logged to stderr for debugging.
-        """
+    async def ask(self, question: str, timeout_ms: int = 45000) -> str:
+        """Ask a question. Uses AI Mode if warmup detected support, else organic."""
         async with self._lock:
             from urllib.parse import quote
             url = f"https://www.google.com/search?q={quote(question)}&hl=en&gl=us"
-            await self._navigate(url)
-            # Wait for DOM to settle
-            await asyncio.sleep(2)
-            js = _ASK_JS.replace("%QUERY%", json.dumps(question))
-            try:
-                result = await asyncio.wait_for(self._evaluate(js), timeout=timeout_ms / 1000)
-            except asyncio.TimeoutError:
-                raise RuntimeError("Query timed out")
-            except Exception:
-                await self._warmup()
+
+            if self._supports_aimode:
+                # Strategy A: AI Mode fetch
+                js = _ASK_JS_AIMODE.replace("%QUERY%", json.dumps(question))
+                try:
+                    result = await asyncio.wait_for(self._evaluate(js), timeout=timeout_ms / 1000)
+                except asyncio.TimeoutError:
+                    raise RuntimeError("Query timed out")
+                except Exception:
+                    await self._warmup()
+                    result = await self._evaluate(js)
+            else:
+                # Strategy B: navigate then extract organic from rendered DOM
                 await self._navigate(url)
                 await asyncio.sleep(2)
-                result = await self._evaluate(js)
+                js = _ASK_JS_ORGANIC.replace("%QUERY%", json.dumps(question))
+                try:
+                    result = await asyncio.wait_for(self._evaluate(js), timeout=timeout_ms / 1000)
+                except asyncio.TimeoutError:
+                    raise RuntimeError("Query timed out")
 
         if isinstance(result, dict):
             if result.get("error"):
-                raise RuntimeError(f"{result['error']}: {result.get('finalUrl','')}")
+                raise RuntimeError(f"{result['error']}: {result.get('message','')}")
             answer = result.get("answer", "")
+            strategy = result.get("strategy", "unknown")
             sources = result.get("sources", [])
-            source_label = result.get("source", "unknown")
-            elapsed = result.get("elapsed_ms", 0)
-
+            elapsed_label = ""
+            if "folwrLen" in result:
+                elapsed_label = f" (AI Mode folwr {result['folwrLen']}b)"
+            header = f"[Strategy: {strategy}{elapsed_label}]"
             if sources:
-                # Append source citations as footer
                 source_lines = []
                 for i, s in enumerate(sources[:5], 1):
                     title = s.get("title", s.get("url", ""))
                     url_s = s.get("url", "")
                     source_lines.append(f"  [{i}] {title} - {url_s}")
-                answer = f"{answer}\n\nSources ({source_label}, {elapsed}ms):\n" + "\n".join(source_lines)
-            return answer or "(no answer)"
+                answer = f"{answer}\n\nSources:\n" + "\n".join(source_lines)
+            return f"{header}\n{answer}" if answer else f"{header}\n(no answer)"
         return str(result) if result else ""
 
     async def ask_stream(self, question: str, timeout_ms: int = 45000):
-        """Yield answer in one chunk (AI Overview DOM is single-pass)."""
         text = await self.ask(question, timeout_ms)
         if text:
             yield text
 
     async def stop(self):
-        """Shutdown browser resources and remove owned temporary profile."""
         if self._ws:
             await self._ws.close()
             self._ws = None
@@ -626,7 +585,6 @@ class AIModeEngine:
 
 async def e2e_test():
     import time
-
     cdp = os.environ.get("CDP_URL")
     channel = os.environ.get("BROWSER_CHANNEL", "chrome")
     headless = os.environ.get("HEADLESS", "1") != "0"
@@ -636,21 +594,16 @@ async def e2e_test():
     chromedriver_path = os.environ.get("GEMINI_SEARCH_CHROMEDRIVER") or os.environ.get("UC_CHROMEDRIVER")
     engine = AIModeEngine()
     print(
-        f"Starting... "
-        f"(cdp={cdp or 'self-launch'}, backend={browser_backend or 'subprocess'}, "
+        f"Starting... (cdp={cdp or 'self-launch'}, backend={browser_backend or 'subprocess'}, "
         f"channel={channel}, headless={headless})"
     )
     t0 = time.time()
     await engine.start(
-        cdp_url=cdp,
-        headless=headless,
-        channel=channel,
-        user_data_dir=user_data_dir,
-        browser_backend=browser_backend,
-        proxy_server=proxy_server,
-        chromedriver_path=chromedriver_path,
+        cdp_url=cdp, headless=headless, channel=channel,
+        user_data_dir=user_data_dir, browser_backend=browser_backend,
+        proxy_server=proxy_server, chromedriver_path=chromedriver_path,
     )
-    print(f"  Ready in {time.time()-t0:.1f}s")
+    print(f"  Ready in {time.time()-t0:.1f}s, AI Mode: {engine._supports_aimode}")
 
     tests = [
         ("math", "what is 7*8? answer only the number"),
@@ -662,7 +615,7 @@ async def e2e_test():
         t0 = time.time()
         try:
             ans = await engine.ask(q)
-            print(f"  [{name}] ({time.time()-t0:.1f}s): {ans[:200]}")
+            print(f"  [{name}] ({time.time()-t0:.1f}s): {ans[:300]}")
             if ans:
                 passed += 1
         except Exception as e:
