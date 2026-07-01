@@ -28,6 +28,7 @@ import platform
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
 from pathlib import Path
 from typing import Optional
@@ -269,6 +270,7 @@ class AIModeEngine:
         self._browser_backend = "subprocess"
         self._is_headless = True
         self._supports_aimode = False  # Set during _warmup
+        self._hide_window = True  # Hide headed Chrome window on Windows
 
     async def start(
         self,
@@ -345,6 +347,13 @@ class AIModeEngine:
         profile_dir = self._prepare_user_data_dir(user_data_dir)
         port = int(os.environ.get("GEMINI_SEARCH_CDP_PORT", "19250"))
         proxy = _env_or_value(proxy_server, "GEMINI_SEARCH_PROXY_SERVER")
+        # Window control: minimize on start to avoid blocking the desktop
+        # Default: minimize + small window at -2000,-2000 (off-screen)
+        win_x = int(os.environ.get("GEMINI_SEARCH_WINDOW_X", "-2000"))
+        win_y = int(os.environ.get("GEMINI_SEARCH_WINDOW_Y", "-2000"))
+        win_w = int(os.environ.get("GEMINI_SEARCH_WINDOW_W", "800"))
+        win_h = int(os.environ.get("GEMINI_SEARCH_WINDOW_H", "600"))
+        start_minimized = os.environ.get("GEMINI_SEARCH_START_MINIMIZED", "1") != "0"
 
         args = [
             chrome_path,
@@ -353,6 +362,8 @@ class AIModeEngine:
             "--no-first-run",
             "--no-default-browser-check",
             "--disable-background-timer-throttling",
+            f"--window-size={win_w},{win_h}",
+            f"--window-position={win_x},{win_y}",
         ]
         if proxy:
             args.append(f"--proxy-server={proxy}")
@@ -363,8 +374,23 @@ class AIModeEngine:
         self._proc = subprocess.Popen(
             args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
         )
+        # If headed + Windows + hide requested, immediately move window off-screen
+        if not headless and self._hide_window and sys.platform == "win32":
+            self._hide_chrome_window(self._proc.pid)
         await self._wait_for_cdp(port, f"Chrome subprocess (pid={self._proc.pid})")
         await self._connect_cdp(f"http://127.0.0.1:{port}")
+
+    def _hide_chrome_window(self, pid: int):
+        """Move the headed Chrome window off-screen so it doesn't bother the user."""
+        try:
+            from gemini_search._win_hide import find_chrome_window, hide_window
+        except ImportError:
+            return
+        hwnd = find_chrome_window(pid, timeout=4.0)
+        if hwnd:
+            hide_window(hwnd)
+            sys.stderr.write(f"[gemini-search] Chrome PID {pid} hidden (HWND={hwnd})\n")
+            sys.stderr.flush()
 
     async def _launch_undetected_chrome(
         self,
