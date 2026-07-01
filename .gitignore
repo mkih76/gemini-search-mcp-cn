@@ -9,3 +9,6 @@ dist/
 .env
 *.log
 .pytest_cache/
+*.json.tmp
+.uc-probe.json
+headless-reuse-result.json
