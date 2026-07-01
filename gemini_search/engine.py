@@ -1,9 +1,18 @@
-"""Lightweight engine for Google AI Mode.
+"""Lightweight engine for Google Search AI Overview (DOM-scraped).
 
-The default backend launches a real Chrome/Chromium subprocess and connects to
-it through the Chrome DevTools Protocol (CDP). An optional
-undetected-chromedriver backend can be enabled when a normal subprocess profile
-is challenged by Google CAPTCHA.
+Forked from gemini-search-mcp by Sophomoresty.
+Original used Google AI Mode via folwr token endpoint, which:
+  - Only works on US-region IPs with full AI Mode rollout
+  - Broke when Google changed the page structure (data-srtst no longer in HTML)
+  - Forced a redirect to google.com.hk which disabled AI Mode for non-US users
+
+This fork uses Google Search AI Overview directly:
+  - Loads https://www.google.com/search?q=... (Google handles redirect naturally)
+  - Waits for the AI Overview container (#m-x-content, class D5ad8b) to render
+  - Extracts synthesized answer + sources from the rendered DOM
+  - Falls back to top organic results if AI Overview is not available
+
+Compatible with the original MCP server entry points (gemini_search_mcp, gemini-search).
 """
 from __future__ import annotations
 
@@ -24,61 +33,111 @@ except ImportError:  # pragma: no cover - surfaced at runtime by _connect_cdp
     websockets = None
 
 
+# JavaScript that:
+#   1. waits for #m-x-content (AI Overview container) to render, with timeout
+#   2. extracts the visible text + sources
+#   3. falls back to top organic results if AI Overview is absent
 _ASK_JS = """
 (async (q) => {
-    try {
-        const pageUrl = 'https://www.google.com.hk/search?q=' + encodeURIComponent(q) + '&hl=en&gl=us&udm=50&aep=1&ntc=1';
-        const r1 = await fetch(pageUrl, {credentials:'include'});
-        if (!r1.ok) return {error:'fetch_status_' + r1.status, htmlLen:0};
-        const html = await r1.text();
-        const m = (p) => { const x = html.match(p); return x ? x[1] : ''; };
-        const srtst = m(/data-srtst="([^"]+)"/);
-        if (!srtst) return {error:'no_token', htmlLen:html.length, preview:html.substring(0,200)};
-        const xsrf = m(/data-xsrf-folwr-token="([^"]+)"/);
-        const garc = m(/data-garc="([^"]+)"/);
-        const lro = m(/data-lro-token="([^"]+)"/);
-        const mlros = m(/data-lro-signature="([^"]+)"/);
-        const ei = m(/data-ei="([^"]+)"/);
-        const stkp = m(/data-stkp="([^"]+)"/);
-        const ved = m(/aria-current="page"[^>]*data-ved="([^"]+)"/);
-        const sca = m(/sca_esv=([a-f0-9]+)/);
-        const p = new URLSearchParams({srtst,garc,mlro:lro,mlros,ei,q,yv:'3',vet:'1'+ved+'..i',ved,aep:'1',gl:'us',hl:'en',sca_esv:sca,udm:'50',stkp,cs:'0',async:'_fmt:adl,_xsrf:'+xsrf});
-        const r2 = await fetch('https://www.google.com.hk/async/folwr?'+p.toString(), {credentials:'include'});
-        if (!r2.ok) return {error:'folwr_status_' + r2.status};
-        const fh = await r2.text();
-        const div = document.createElement('div');
-        div.innerHTML = fh;
-        // Remove non-content elements
-        div.querySelectorAll('script,style,button,noscript,[aria-hidden="true"],span[style*="display:none"],.LGKDTe,.SGF5Lb').forEach(x => x.remove());
-        // Collect text from ALL answer blocks: pTRUV first (short answers), then n6owBd (paragraphs)
-        let parts = [];
-        div.querySelectorAll('.pTRUV').forEach(el => {
-            const t = el.textContent.trim();
-            if (t && t.length > 1) parts.push(t);
+    const wait = (ms) => new Promise(r => setTimeout(r, ms));
+    const t0 = Date.now();
+    const TIMEOUT_MS = 15000;
+
+    // Helper: clean Google SERP noise
+    const clean = (s) => {
+        if (!s) return '';
+        return s
+            .replace(/\\s+/g, ' ')
+            .replace(/AI Overview\\s*\\+\\d+\\s*/g, '')
+            .replace(/Show more/gi, '')
+            .trim();
+    };
+
+    // Try to find AI Overview (container with class D5ad8b or id m-x-content)
+    let aiContainer = null;
+    while (Date.now() - t0 < TIMEOUT_MS) {
+        aiContainer = document.querySelector('#m-x-content')
+                   || document.querySelector('.D5ad8b')
+                   || document.querySelector('[data-attrid="AIOverview"]');
+        if (aiContainer && aiContainer.innerText && aiContainer.innerText.length > 100) {
+            break;
+        }
+        aiContainer = null;
+        await wait(500);
+    }
+
+    if (aiContainer) {
+        // Extract the main synthesized answer text
+        // AI Overview structure: header + multiple <p> or list items + sources
+        const mainBlocks = [];
+        aiContainer.querySelectorAll('p, li').forEach(el => {
+            const t = clean(el.innerText);
+            if (t && t.length > 30 && !t.startsWith('AI Overview')) {
+                mainBlocks.push(t);
+            }
         });
-        div.querySelectorAll('.n6owBd').forEach(el => {
-            const t = el.textContent.trim();
-            if (t && t.length > 10) parts.push(t);
+        // De-dupe consecutive identicals
+        const seen = new Set();
+        const unique = [];
+        for (const b of mainBlocks) {
+            if (!seen.has(b)) { seen.add(b); unique.push(b); }
+        }
+
+        // Extract source citations
+        const sources = [];
+        aiContainer.querySelectorAll('a[href^="http"]').forEach(a => {
+            const href = a.href;
+            const title = clean(a.innerText);
+            if (href && !href.includes('google.com') && title) {
+                sources.push({title, url: href});
+            }
         });
-        // Fallback: all dir=ltr blocks minus citation containers
-        if (!parts.length) {
-            div.querySelectorAll('.mZJni,.XEqVsf,.ub891').forEach(x => x.remove());
-            div.querySelectorAll('[dir="ltr"]').forEach(el => {
-                const t = el.textContent.trim();
-                if (t.length > 30) parts.push(t);
+
+        return {
+            ok: true,
+            source: 'ai_overview',
+            answer: unique.join('\\n\\n'),
+            sources: sources.slice(0, 8),
+            elapsed_ms: Date.now() - t0,
+        };
+    }
+
+    // FALLBACK: no AI Overview, return top 5 organic results
+    const organic = [];
+    document.querySelectorAll('div.g, div[jscontroller][data-hveid]').forEach((el, idx) => {
+        if (organic.length >= 5) return;
+        const titleEl = el.querySelector('h3');
+        const linkEl = el.querySelector('a[href^="http"]');
+        const snippetEl = el.querySelector('.VwiC3b, .yXK7lf, [data-content-feature]');
+        if (titleEl && linkEl && snippetEl) {
+            organic.push({
+                title: clean(titleEl.innerText),
+                url: linkEl.href,
+                snippet: clean(snippetEl.innerText),
             });
         }
-        let text = parts.join('\\n\\n');
-        // Clean trailing UI noise
-        const noise = ['Copy','Share','Good response','Bad response','About this result','Show all','AI responses may include mistakes','Tell me which'];
-        for (const n of noise) { while (text.endsWith(n)) text = text.slice(0, -n.length).trim(); }
-        return {ok:true, answer:text, folwrLen:fh.length};
-    } catch(e) {
-        return {error:'js_exception', message:e.message};
+    });
+
+    if (organic.length === 0) {
+        return {
+            ok: false,
+            error: 'no_results',
+            elapsed_ms: Date.now() - t0,
+            finalUrl: window.location.href,
+        };
     }
+
+    return {
+        ok: true,
+        source: 'organic_fallback',
+        answer: organic.map((r, i) =>
+            `[${i+1}] ${r.title}\\n${r.snippet}\\n${r.url}`
+        ).join('\\n\\n'),
+        sources: organic,
+        elapsed_ms: Date.now() - t0,
+    };
 })(%QUERY%)
 """
-
 
 
 def _env_or_value(value: Optional[str], *env_names: str) -> Optional[str]:
@@ -224,7 +283,12 @@ def _normalize_browser_backend(backend: Optional[str]) -> str:
 
 
 class AIModeEngine:
-    """Single-tab Chrome engine via raw CDP."""
+    """Single-tab Chrome engine via raw CDP.
+
+    Loads Google Search results pages and waits for the AI Overview
+    container (#m-x-content) to render, then extracts synthesized answer
+    plus source citations.
+    """
 
     def __init__(self):
         self._proc = None
@@ -249,16 +313,7 @@ class AIModeEngine:
         proxy_server: Optional[str] = None,
         chromedriver_path: Optional[str] = None,
     ):
-        """Start Chrome and connect via CDP.
-
-        If cdp_url is provided, connects to an existing Chrome instance.
-        Otherwise launches a browser using the selected backend:
-        - subprocess: plain Chrome/Edge/Chromium with minimal flags.
-        - undetected: undetected-chromedriver + CDP, useful for CAPTCHA probes.
-
-        user_data_dir can be supplied to persist cookies across runs. When it is
-        omitted, a temporary profile is created and deleted on stop.
-        """
+        """Start Chrome and connect via CDP."""
         self._cdp_url = cdp_url
         self._browser_backend = _normalize_browser_backend(
             _env_or_value(browser_backend, "GEMINI_SEARCH_BROWSER_BACKEND")
@@ -337,6 +392,7 @@ class AIModeEngine:
             "--no-first-run",
             "--no-default-browser-check",
             "--disable-background-timer-throttling",
+            "--lang=en-US",
         ]
         if proxy:
             args.append(f"--proxy-server={proxy}")
@@ -479,8 +535,13 @@ class AIModeEngine:
         await asyncio.sleep(1)
 
     async def _warmup(self):
-        """Navigate to Google search to build cookie session."""
-        await self._navigate("https://www.google.com.hk/search?q=hello&hl=en&gl=us")
+        """Navigate to Google search to verify cookies and warm up the session.
+
+        Uses google.com (not .hk) so AI Overview eligibility is detected
+        correctly for the user's region. The page may redirect to .hk on
+        its own; both render AI Overview identically.
+        """
+        await self._navigate("https://www.google.com/search?q=hello&hl=en&gl=us")
         url = await self._evaluate("window.location.href")
         if "/sorry/" in (url or ""):
             raise RuntimeError(
@@ -489,8 +550,18 @@ class AIModeEngine:
             )
 
     async def ask(self, question: str, timeout_ms: int = 45000) -> str:
-        """Ask a question via Google AI Mode."""
+        """Ask a question via Google Search and return the AI Overview answer.
+
+        On miss, falls back to top organic results.
+        Returns a plain string for MCP tool compatibility. The dict result
+        is logged to stderr for debugging.
+        """
         async with self._lock:
+            from urllib.parse import quote
+            url = f"https://www.google.com/search?q={quote(question)}&hl=en&gl=us"
+            await self._navigate(url)
+            # Wait for DOM to settle
+            await asyncio.sleep(2)
             js = _ASK_JS.replace("%QUERY%", json.dumps(question))
             try:
                 result = await asyncio.wait_for(self._evaluate(js), timeout=timeout_ms / 1000)
@@ -498,16 +569,31 @@ class AIModeEngine:
                 raise RuntimeError("Query timed out")
             except Exception:
                 await self._warmup()
+                await self._navigate(url)
+                await asyncio.sleep(2)
                 result = await self._evaluate(js)
 
         if isinstance(result, dict):
             if result.get("error"):
-                raise RuntimeError(f"{result['error']}: {result.get('message','')}")
-            return result.get("answer", "")
+                raise RuntimeError(f"{result['error']}: {result.get('finalUrl','')}")
+            answer = result.get("answer", "")
+            sources = result.get("sources", [])
+            source_label = result.get("source", "unknown")
+            elapsed = result.get("elapsed_ms", 0)
+
+            if sources:
+                # Append source citations as footer
+                source_lines = []
+                for i, s in enumerate(sources[:5], 1):
+                    title = s.get("title", s.get("url", ""))
+                    url_s = s.get("url", "")
+                    source_lines.append(f"  [{i}] {title} - {url_s}")
+                answer = f"{answer}\n\nSources ({source_label}, {elapsed}ms):\n" + "\n".join(source_lines)
+            return answer or "(no answer)"
         return str(result) if result else ""
 
     async def ask_stream(self, question: str, timeout_ms: int = 45000):
-        """Yield answer in one chunk."""
+        """Yield answer in one chunk (AI Overview DOM is single-pass)."""
         text = await self.ask(question, timeout_ms)
         if text:
             yield text
@@ -550,7 +636,7 @@ async def e2e_test():
     chromedriver_path = os.environ.get("GEMINI_SEARCH_CHROMEDRIVER") or os.environ.get("UC_CHROMEDRIVER")
     engine = AIModeEngine()
     print(
-        "Starting... "
+        f"Starting... "
         f"(cdp={cdp or 'self-launch'}, backend={browser_backend or 'subprocess'}, "
         f"channel={channel}, headless={headless})"
     )
@@ -576,7 +662,7 @@ async def e2e_test():
         t0 = time.time()
         try:
             ans = await engine.ask(q)
-            print(f"  [{name}] ({time.time()-t0:.1f}s): {ans[:120]}")
+            print(f"  [{name}] ({time.time()-t0:.1f}s): {ans[:200]}")
             if ans:
                 passed += 1
         except Exception as e:
