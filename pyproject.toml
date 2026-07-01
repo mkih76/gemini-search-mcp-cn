@@ -1,0 +1,31 @@
+[project]
+name = "gemini-search-mcp"
+version = "0.4.0"
+description = "MCP server for web search powered by Google AI Mode (Gemini). Free, unlimited, no API key."
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.10"
+dependencies = [
+    "websockets>=12.0",
+    "fastapi>=0.111",
+    "uvicorn[standard]>=0.30",
+    "mcp[cli]>=1.0",
+]
+
+[project.optional-dependencies]
+undetected = [
+    "undetected-chromedriver>=3.5.5",
+    "selenium>=4.30",
+]
+
+[project.scripts]
+gemini-search = "gemini_search.server:main"
+gemini-search-mcp = "gemini_search_mcp:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["gemini_search*", "gemini_search_mcp*"]

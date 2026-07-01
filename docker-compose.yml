@@ -1,0 +1,9 @@
+services:
+  gemini-search:
+    build: .
+    ports:
+      - "8080:8080"
+    restart: unless-stopped
+    shm_size: "2gb"
+    environment:
+      - PYTHONUNBUFFERED=1
